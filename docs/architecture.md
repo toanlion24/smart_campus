@@ -4,6 +4,8 @@
 
 Ngày 05/11/2026, thiết kế đã được duyệt. Đây là kiến trúc mục tiêu, không mô tả mọi thành phần đã tồn tại. [Nguồn hiện có](legacy-analysis.md) là căn cứ đánh giá phần tái sử dụng.
 
+> **Cập nhật 06/11/2026:** mục 1–8 mô tả MVP local đã duyệt. [Mục 9](#9-bổ-sung-06112026-kiến-trúc-production-và-các-điểm-còn-thiếu) bổ sung kiến trúc production theo kế hoạch 8 tuần v2: điểm danh RFID thật, Face 1:1 qua AI service, kho object private, backup ngoài máy chủ và giám sát. Mục 9 là đề xuất chờ nhóm/GV duyệt, chưa có code.
+
 ## 1. Quyết định công nghệ
 
 | Quyết định đề xuất | Lý do và trade-off |
@@ -144,3 +146,66 @@ PostgreSQL cung cấp [row-level locks](https://www.postgresql.org/docs/17/expli
 ## 8. Điểm cần duyệt và rủi ro
 
 Mặc định: Express + pg, Flutter Web/Android, demo in-process, PostgreSQL worker, không thêm ORM/Redis/model. Rủi ro chính là schema prototype đã tồn tại cần migration có backup, điện áp LCD chưa xác nhận, một reader phải demo tuần tự, license nguồn cần kiểm trước phân phối, và chưa có hardware evidence. Chỉ bắt đầu module lớn sau khi người dùng duyệt [roadmap](implementation-plan.md).
+
+## 9. Bổ sung 06/11/2026: kiến trúc production và các điểm còn thiếu
+
+Đối chiếu sơ đồ trong kế hoạch 8 tuần v2 với source hiện tại cho thấy năm khoảng trống: điểm danh RFID trên backend `campus`, Face 1:1 thật, nơi lưu template/ảnh Face, backup ngoài máy chủ và giám sát. Ba điểm khác của sơ đồ đã có trong source: gắn lần quẹt với đúng thao tác (`device_contexts` + `device_challenges` + `identity_assertions`), lệnh cổng do server phát (`gate_commands`) và 28 ca kiểm thử gốc ([THIET_KE_THAM_KHAO_02_11.md](THIET_KE_THAM_KHAO_02_11.md)).
+
+### 9.1 Sơ đồ production mục tiêu
+
+```mermaid
+flowchart TB
+  subgraph CLIENT[Client không đáng tin]
+    E[ESP32 + MFRC522<br/>hàng đợi NVS, cùng eventId khi retry]
+    W[Flutter Web<br/>camera trình duyệt qua HTTPS]
+    A[Flutter Android<br/>APK ký số]
+  end
+  E -->|HTTPS, device credential| PX
+  W -->|HTTPS, cookie + CSRF| PX
+  A -->|HTTPS, bearer| PX
+  PX[Caddy: TLS ACME tự gia hạn<br/>cổng 80/443 duy nhất, access log JSON có duration]
+  subgraph PRIVATE[Mạng nội bộ Docker, internal: true]
+    API[Backend Express<br/>auth, RBAC, ví, điểm danh, căn tin, gửi xe]
+    WK[Worker outbox<br/>cùng image backend]
+    AI[AI service FastAPI<br/>quality, detect, align, embed, PAD]
+    DB[(PostgreSQL 17<br/>ledger, điểm danh, metadata object)]
+    OBJ[(Kho object private<br/>template Face mã hóa, evidence)]
+  end
+  PX --> API
+  API -->|service token, timeout| AI
+  API --> DB
+  API --> OBJ
+  WK --> DB
+  subgraph OPS[Vận hành]
+    BK[Job backup hằng ngày<br/>pg_dump + object, mã hóa]
+    MON[Giám sát + cảnh báo<br/>health, disk, backup, P95]
+  end
+  DB --> BK
+  OBJ --> BK
+  BK -->|đẩy ra ngoài VPS| OFF[(Kho backup ngoài máy chủ)]
+  MON -.->|kiểm từ ngoài| PX
+  MON -.-> API
+  MON -.-> BK
+  MON -->|Telegram hoặc email| OPR[Người vận hành]
+```
+
+Khác biệt so với sơ đồ trong kế hoạch: thêm worker, kho object, khối giám sát; backup lấy cả DB lẫn object; AI chỉ backend gọi được và không có credential DB. Caddy ghi `duration` trong access log JSON (tương đương `$request_time` của Nginx) để tính P95 phía server.
+
+### 9.2 Năm khoảng trống và cách xử lý đề xuất
+
+| Khoảng trống | Hiện trạng trong source | Đề xuất | Tuần |
+| --- | --- | --- | --- |
+| Điểm danh RFID trên backend `campus` | `createSession` chỉ nhận thiết bị `ATTENDANCE_CAMERA` ([attendance.ts:15](../backend/src/attendance.ts)); `attendance_records.source` chỉ `DEMO`/`MANUAL`; RFID điểm danh chỉ có ở prototype `/v1/device-events` | Thêm role thiết bị `ATTENDANCE_READER`; context điểm danh nhận nhiều lượt quét trong phiên; scan ghi `attendance_records` ngay trong transaction của `/device-events`. Xem [migration 004](database-design.md#11-migration-004-đề-xuất-06112026) và [API](api-contracts.md#10-bổ-sung-06112026-điểm-danh-rfid-face-11-thật-object-và-vận-hành) | 2 |
+| Face 1:1 thật | AI trả 503 ở `/internal/face/verify`; compose chỉ chạy AI trong profile `future-camera`; mọi Face là DEMO | Client gửi ảnh nén (cạnh dài ≤ 800 px) lên backend; backend lấy template của đúng sinh viên, gọi AI; đạt thì cấp `identity_assertions` hạn 60 giây, dùng một lần, gắn purpose và context. Lưu từng lần xác minh để tính FMR/FNMR/PAD/độ trễ | 3 |
+| Nơi lưu template và ảnh Face | Không có object storage; `biometric_profiles` không có cột template | Kho object private (MinIO một node trong mạng nội bộ, hoặc thư mục volume riêng nếu nhóm muốn ít thành phần). Template mã hóa AES-GCM, khóa ngoài DB; bảng `stored_objects` giữ hash, retention, trạng thái xóa | 3–4 |
+| Backup ngoài máy chủ | Có `pg_dump` + restore kiểm chứng thủ công ([verify-compose-backup.ps1](../tools/verify-compose-backup.ps1)); chưa có lịch, chưa mã hóa, chưa ra ngoài VPS | Job hằng ngày: `pg_dump -Fc` + snapshot kho object → restic (mã hóa sẵn) đẩy lên kho ngoài VPS; giữ 7 bản ngày + 4 bản tuần; job ghi kết quả để giám sát đọc | 4, 6 |
+| Giám sát và cảnh báo | Chỉ có `/healthz`, `/readyz` và log stdout | Kiểm uptime từ bên ngoài VPS; script cron kiểm disk, container restart, tuổi bản backup mới nhất; báo qua Telegram hoặc email. P95 tính từ access log Caddy theo nhóm route | 6 |
+
+Lựa chọn MinIO hay thư mục volume, dịch vụ uptime và kênh cảnh báo là quyết định của nhóm trong tuần 1; tài liệu không giả định đã mua hay cài.
+
+### 9.3 Các điểm khác cần chốt với giảng viên
+
+- **Xác nhận thanh toán.** Thiết kế trong kế hoạch cho phép xác nhận bằng RFID hoặc phiên Face. Source hiện yêu cầu sinh viên duyệt mọi khoản dương trên app bằng PIN (`payment_approvals`); quẹt thẻ chỉ nhận diện người. Đề xuất giữ PIN vì UID có thể sao chép; Face đạt PAD có thể thay PIN cho khoản nhỏ nếu GV đồng ý.
+- **HTTPS.** [Caddyfile](../deploy/Caddyfile) dùng `tls internal` (CA local). Staging và production phải bỏ dòng này để Caddy tự lấy chứng chỉ ACME cho tên miền thật; ESP32 nạp root CA tương ứng.
+- **Hàng đợi ESP32.** Firmware `smart_campus.ino` lưu một sự kiện pending trong NVS (`Preferences`), còn đoạn "Retry ... trong RAM" ở README thuộc prototype tuần 1. Hàng đợi chỉ giữ **một** sự kiện: khi còn pending, vòng lặp không đọc thẻ mới, nên mất mạng lâu thì cả hàng sinh viên phải chờ. Với điểm danh, cần quyết định giữ hàng đợi một phần tử (đơn giản, an toàn) hay mở rộng thành hàng đợi nhiều sự kiện trong NVS. Cần thử rút điện giữa lúc gửi trước khi ghi đạt tiêu chí 4 tuần 2.
+- **Môi trường production.** Bootstrap từ chối `APP_ENV=production` khi còn provider DEMO/SIMULATOR/MOCK. Production theo kế hoạch vẫn dùng ví thử nghiệm và cổng mô phỏng, nên cần thêm chế độ `pilot` cho phép `PAYMENT_PROVIDER=MOCK`, `GATE_PROVIDER=SIMULATOR` nhưng tắt simulator route và bắt buộc Face REAL hoặc tắt Face.

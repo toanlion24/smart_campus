@@ -59,3 +59,7 @@ Credential nằm trong .work/*access.txt, deploy/.env và firmware/smart_campus/
 - Compose đã được dừng sau kiểm thử; giữ volume, không dùng down -v. Docker engine được giữ vì có container khác chạy. Native local đã khởi động tại localhost:8081; xem runbook khi cần chạy lại.
 - Image MVP được pin theo chính digest cache đã kiểm: evidence/container-images.json. Node base trước build đã resolve đúng digest đó; metadata Web trong final image khớp file host: compose-final-image.json.
 - Offline YAML parse, đối chiếu image refs với inspected digests, installer pins với toolchain thực và checksum archive CLI đều PASS: pinned-environment.json. **Docker compose config --quiet sau chỉnh pin chưa chạy:** automatic approval review không thực hiện được vì hạn mức sử dụng; đây không phải kết luận action unsafe. Config/runtime/E2E trước pin đã PASS trên cùng image contents; không báo lần kiểm CLI cuối đã chạy.
+
+## Khoảng trống so với kế hoạch 8 tuần v2 (06/11/2026)
+
+Ngoài các mục ở trên, đối chiếu với kế hoạch 8 tuần v2 cho thấy: backend `campus` **chưa điểm danh bằng RFID thật** (chỉ thiết bị `ATTENDANCE_CAMERA` + Face DEMO; RFID điểm danh chỉ có ở prototype `/v1/device-events`); AI service chưa được backend gọi; chưa có kho object, backup ngoài máy chủ và giám sát. Đề xuất xử lý: [architecture.md mục 9](architecture.md#9-bổ-sung-06112026-kiến-trúc-production-và-các-điểm-còn-thiếu), [kế hoạch mục 8](implementation-plan.md#8-đề-xuất-bổ-sung-kế-hoạch-8-tuần-v2-06112026).

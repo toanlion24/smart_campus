@@ -162,3 +162,27 @@ GĐ3 chưa đóng: user xác nhận ESP32 Dev Board, Windows chưa thấy serial
 | Mở rộng phạm vi vượt MVP | Xong từng cổng kiểm thử; camera/payment thật là giai đoạn riêng | Người dùng duyệt thay đổi scope |
 
 **Trạng thái hiện tại:** đã được phép triển khai. Test phần mềm, build, Docker và phần cứng phải ghi evidence riêng; không tự nhận đã kiểm phần cứng từ kiểm thử HTTP hoặc Markdown.
+
+## 8. Đề xuất bổ sung kế hoạch 8 tuần v2 (06/11/2026)
+
+Kế hoạch 8 tuần v2 (file Word của GV) chấm theo 5 tiêu chí mỗi tuần. Đối chiếu với source, các tiêu chí dưới đây chưa có việc tương ứng hoặc cần ghi rõ hơn để GV kiểm được. Đây là đề xuất để nhóm mang tới buổi chốt tuần 1, **không sửa file kế hoạch của GV**. Chi tiết kỹ thuật: [architecture.md mục 9](architecture.md#9-bổ-sung-06112026-kiến-trúc-production-và-các-điểm-còn-thiếu), [migration 004](database-design.md#11-migration-004-đề-xuất-06112026), [API mục 10](api-contracts.md#10-bổ-sung-06112026-điểm-danh-rfid-face-11-thật-object-và-vận-hành).
+
+| Tuần | Bổ sung vào công việc trọng tâm | Minh chứng thêm | Tiêu chí liên quan |
+| --- | --- | --- | --- |
+| 1 | Chốt: kho object (MinIO hay volume), dịch vụ uptime, kênh cảnh báo, nơi lưu backup ngoài VPS; chốt cách xác nhận thanh toán (PIN hay Face); chốt yếu tố vị trí cho điểm danh Face | Biên bản quyết định kèm chi phí từng dịch vụ | 2, 4 |
+| 2 | Viết migration 004 phần 11.2; cho phép role `ATTENDANCE_READER`; scan RFID ghi điểm danh trên backend `campus`; Caddy dùng ACME thay `tls internal` | TAP test quét lặp/retry/ngoài roster/phiên đóng trên `campus`; log ESP32 quét thẻ thật qua HTTPS staging | 2, 3, 4 |
+| 3 | Migration 004 phần 11.3–11.4; nối AI service (`/internal/face/embed`, `/verify`) và chọn model PAD; route `/face-verifications`; kho object với template mã hóa | Truy vấn `face_verifications` tính FMR, FNMR, PAD, độ trễ trên tập test tách riêng | 1, 2, 3, 4 |
+| 4 | Job backup hằng ngày bằng restic: `pg_dump` + kho object, mã hóa, đẩy ngoài VPS; restore staging kiểm `sha256` object | Log job, bản restore, truy vấn đối soát ledger | 5 |
+| 5 | Thêm vào bộ 28 ca: điểm danh RFID trên `campus`, Face MATCH/NO_MATCH/REJECTED/ERROR, assertion hết hạn hoặc sai purpose | Actual và evidence của các ca mới | 2, 4, 5 |
+| 6 | Chế độ `APP_ENV=pilot` (cho phép MOCK/SIMULATOR, tắt simulator route); cron kiểm disk/container/tuổi backup; uptime từ ngoài VPS; P95 từ access log Caddy; route `/admin/ops/status` | Ảnh chụp cảnh báo thật tới người vận hành; bảng P95 theo nhóm route | 2, 3, 4 |
+| 7 | Theo dõi `face_verifications` và `device_events` từ chối để hướng dẫn người dùng | Thống kê lượt Face thất bại theo lý do | 2, 4 |
+| 8 | Bàn giao khóa mã hóa template, mật khẩu restic, token AI qua kênh riêng; kế hoạch xóa dữ liệu Face sau pilot | Biên bản bàn giao secret và xóa dữ liệu | 3, 4 |
+
+Rủi ro mới cần thêm vào bảng mục 7:
+
+| Rủi ro | Cách giảm | Cần ai/chốt khi nào |
+| --- | --- | --- |
+| Điểm danh RFID chưa có trên `campus` | Làm migration 004 phần 11.2 đầu tuần 2, trước staging | Người phụ trách backend, tuần 2 |
+| Chưa có model PAD | Chọn model có license phù hợp trong tuần 1–2; chưa có thì ghi Face chưa đạt và dùng RFID (điều kiện trước UAT của kế hoạch) | Người phụ trách AI, tuần 3 |
+| Điểm danh Face từ xa | Bắt buộc yếu tố vị trí (mã đổi theo thời gian hoặc camera trong phòng) | Nhóm + GV, tuần 1 |
+| Hàng đợi ESP32 chỉ một sự kiện | Thử mất mạng trong giờ học; mở rộng hàng đợi NVS nếu hàng chờ quá lâu | Người phụ trách phần cứng, tuần 2 |

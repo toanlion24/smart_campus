@@ -4,6 +4,8 @@
 
 05/11/2026 — thiết kế PostgreSQL 17 chờ duyệt. **Chưa tạo/chạy migration mới**. `../database/001.sql` chỉ là schema prototype; tên bảng dưới đây là đích mới, không được coi là đã tồn tại.
 
+> **Cập nhật 06/11/2026:** schema `campus` đã được tạo bằng [002-campus.sql](../database/migrations/002-campus.sql) và [003-operational-indexes.sql](../database/migrations/003-operational-indexes.sql). Khi dictionary dưới đây khác SQL (ví dụ `vehicle_authorizations` dùng PK `(vehicle_id, student_id)`, `idempotency_records` dùng PK `(scope, key)`), **SQL là căn cứ**. [Mục 11](#11-migration-004-đề-xuất-06112026) đề xuất migration 004 cho điểm danh RFID, Face 1:1 thật và kho object.
+
 ## 1. Quy ước
 
 - PK dùng UUID, nghiệp vụ tiền/point dùng BIGINT integer, không float. Amount >0; ledger delta signed khác 0. API trả amount/point dạng chuỗi thập phân; tỷ lệ point/VND dùng số nguyên tử/mẫu dương và quy tắc rounding có version.
@@ -228,3 +230,116 @@ Thứ tự chuẩn cho checkout/refund: **source aggregate (order hoặc parking
 Migration code chỉ viết ở giai đoạn tương ứng sau duyệt. Không DROP bảng/column cũ trước đối chiếu/backfill và thời gian rollback; rollback tài chính ưu tiên forward fix, không xóa posting mới. Dev database mới có thể tạo schema đích sạch từ migration chain, nhưng mọi reset phải chỉ rõ DB test và được phân biệt với DB đang có dữ liệu. Seed synthetic có ID ổn định, không user thật, không credential hardcode, không reapply để cộng point lần hai.
 
 Nguồn tham khảo: PostgreSQL [row locks](https://www.postgresql.org/docs/17/explicit-locking.html), [partial indexes](https://www.postgresql.org/docs/17/indexes-partial.html). SQL minh họa trong tài liệu chưa là bằng chứng migration thực thi được.
+
+## 11. Migration 004 đề xuất (06/11/2026)
+
+Migration 004 lấp ba khoảng trống của schema `campus` so với kế hoạch 8 tuần v2. Đây là SQL đề xuất để review, **chưa có file migration, chưa chạy**. Tên constraint CHECK dưới đây là tên PostgreSQL tự sinh cho CHECK khai báo inline; phải kiểm bằng `\d campus.<bảng>` trên DB thật trước khi viết file.
+
+### 11.1 ERD phần bổ sung
+
+```mermaid
+erDiagram
+  devices ||--o{ device_contexts : opens
+  attendance_sessions ||--o{ device_contexts : "context điểm danh"
+  device_contexts ||--o{ identity_assertions : "nhiều lượt quét"
+  identity_assertions ||--o| attendance_records : "ghi nhận"
+  attendance_session_roster ||--o| attendance_records : recorded
+  students ||--o{ biometric_profiles : enrolls
+  biometric_profiles }o--|| stored_objects : "template mã hóa"
+  students ||--o{ face_verifications : "xác minh 1:1"
+  biometric_profiles ||--o{ face_verifications : "so với"
+  face_verifications ||--o| identity_assertions : "đạt thì cấp"
+  stored_objects ||--o{ face_verifications : "ảnh evidence nếu có consent"
+```
+
+### 11.2 Điểm danh RFID trên `campus`
+
+Hiện `createSession` chỉ nhận `ATTENDANCE_CAMERA`, mỗi `device_contexts` bị tiêu thụ sau một lượt quét và `attendance_records.source` không có `REAL`. Một phiên điểm danh cần một context sống suốt phiên và nhận nhiều thẻ.
+
+```sql
+SET LOCAL search_path = campus, public;
+
+-- Role thiết bị mới cho reader trong phòng học.
+ALTER TABLE devices DROP CONSTRAINT devices_role_check;
+ALTER TABLE devices ADD CONSTRAINT devices_role_check CHECK (role IN
+  ('PARKING_ENTRY','PARKING_EXIT','CANTEEN_POS','RFID_ENROLLMENT','ATTENDANCE_CAMERA','ATTENDANCE_READER'));
+
+-- Context điểm danh nhận nhiều lượt quét đến khi phiên đóng.
+ALTER TABLE device_contexts ADD COLUMN multi_use boolean NOT NULL DEFAULT false;
+ALTER TABLE device_contexts ADD CONSTRAINT multi_use_only_attendance
+  CHECK (NOT multi_use OR purpose = 'ATTENDANCE');
+
+-- Bản ghi điểm danh biết nguồn thật, phương thức và lần xác thực đã dùng.
+ALTER TABLE attendance_records DROP CONSTRAINT attendance_records_source_check;
+ALTER TABLE attendance_records ADD CONSTRAINT attendance_records_source_check
+  CHECK (source IN ('REAL','DEMO','MANUAL'));
+ALTER TABLE attendance_records
+  ADD COLUMN method text CHECK (method IN ('RFID','FACE','MANUAL')),
+  ADD COLUMN identity_assertion_id uuid UNIQUE REFERENCES identity_assertions;
+ALTER TABLE attendance_records ADD CONSTRAINT real_needs_assertion
+  CHECK (source <> 'REAL' OR (identity_assertion_id IS NOT NULL AND method IN ('RFID','FACE')));
+```
+
+Chống trùng vẫn dựa vào ràng buộc có sẵn: `device_events UNIQUE(device_id, event_id)` cho retry của ESP32 và `attendance_records UNIQUE(session_id, student_id)` cho quét lặp. Mở phiên tạo context `multi_use` hết hạn lúc `schedules.ends_at`; đóng phiên chuyển context sang `CONSUMED` trong cùng transaction tạo ABSENT. Code cần sửa: `attendance.createSession/openSession` (nhận `ATTENDANCE_READER`), `devices.roleForPurpose` (ATTENDANCE nhận cả `ATTENDANCE_READER`), `devices.createContext` (hạn theo phiên thay vì 5 phút), `devices.scan` (context `multi_use` thì ghi điểm danh ngay, không đổi context sang `CONSUMED`) và `devices.changeRole` (cho phép role mới).
+
+### 11.3 Kho object và template Face
+
+```sql
+CREATE TABLE stored_objects(
+  id uuid PRIMARY KEY,
+  kind text NOT NULL CHECK (kind IN ('FACE_TEMPLATE','FACE_EVIDENCE','PRODUCT_IMAGE')),
+  object_key text UNIQUE NOT NULL,          -- đường dẫn trong kho private, không phải URL công khai
+  sha256 text NOT NULL,
+  size_bytes bigint NOT NULL CHECK (size_bytes > 0),
+  content_type text NOT NULL,
+  encryption_key_id text,                    -- bắt buộc với dữ liệu Face
+  owner_student_id uuid REFERENCES students,
+  retention_until timestamptz,
+  erased_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (kind = 'PRODUCT_IMAGE' OR (encryption_key_id IS NOT NULL AND owner_student_id IS NOT NULL))
+);
+
+ALTER TABLE biometric_profiles
+  ADD COLUMN template_object_id uuid UNIQUE REFERENCES stored_objects,
+  ADD COLUMN template_dim integer CHECK (template_dim > 0);
+ALTER TABLE biometric_profiles ADD CONSTRAINT real_profile_has_template
+  CHECK (source <> 'REAL' OR status <> 'ACTIVE' OR template_object_id IS NOT NULL);
+```
+
+Template là embedding đã mã hóa AES-GCM, khóa giữ ngoài DB (biến môi trường hoặc file secret, có `key_id` để xoay khóa). Ảnh gốc chỉ lưu khi consent cho phép, có `retention_until`; xóa profile thì xóa object và đặt `erased_at`, không chỉ ẩn trên UI. Backup gồm cả DB lẫn kho object; restore phải khớp `sha256` của từng object.
+
+### 11.4 Lịch sử xác minh Face 1:1
+
+```sql
+CREATE TABLE face_verifications(
+  id uuid PRIMARY KEY,
+  student_id uuid NOT NULL REFERENCES students,
+  profile_id uuid NOT NULL REFERENCES biometric_profiles,
+  context_id uuid NOT NULL REFERENCES device_contexts,
+  purpose text NOT NULL CHECK (purpose IN ('ATTENDANCE','CANTEEN','PARKING')),
+  model_version text NOT NULL,
+  quality_status text NOT NULL CHECK (quality_status IN ('OK','BLURRY','TOO_DARK','NO_FACE','MULTIPLE_FACES')),
+  similarity numeric CHECK (similarity BETWEEN -1 AND 1),
+  threshold numeric NOT NULL,
+  pad_status text NOT NULL CHECK (pad_status IN ('PASS','FAIL','UNKNOWN')),
+  pad_score numeric,
+  decision text NOT NULL CHECK (decision IN ('MATCH','NO_MATCH','REJECTED','ERROR')),
+  ai_latency_ms integer CHECK (ai_latency_ms >= 0),
+  evidence_object_id uuid REFERENCES stored_objects,
+  identity_assertion_id uuid UNIQUE REFERENCES identity_assertions,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (decision <> 'MATCH' OR (pad_status = 'PASS' AND quality_status = 'OK' AND identity_assertion_id IS NOT NULL))
+);
+CREATE INDEX face_verification_history ON face_verifications(student_id, created_at DESC);
+CREATE TRIGGER immutable_face_verification BEFORE UPDATE OR DELETE ON face_verifications
+  FOR EACH ROW EXECUTE FUNCTION immutable_row();
+```
+
+`face_verifications` là nguồn số liệu cho tiêu chí 3 tuần 3 (FMR, FNMR, PAD, độ trễ) và cho audit. Phiên xác minh dùng một lần, hết hạn nhanh và gắn mục đích chính là `identity_assertions` hiện có (`expires_at` 60 giây, `consumed_at`, `context_id`); không thêm bảng `verification_sessions` riêng. `consumeIdentity` đã từ chối assertion hết hạn, đã dùng hoặc sai ngữ cảnh.
+
+### 11.5 Không đưa vào DB
+
+Kết quả backup và số đo giám sát **không** lưu trong DB nghiệp vụ: bản restore sẽ không có lần backup mới nhất và DB chết thì không báo được lỗi. Job backup ghi log/heartbeat ra ngoài (file trạng thái + kênh cảnh báo), xem [architecture.md mục 9](architecture.md#9-bổ-sung-06112026-kiến-trúc-production-và-các-điểm-còn-thiếu).
+
+Kiểm thử bắt buộc khi viết migration 004: áp lên bản restore của DB staging có dữ liệu; quét cùng thẻ hai lần chỉ một bản ghi; retry cùng `eventId` trả ACK cũ; ghi `source='REAL'` thiếu assertion bị CHECK chặn; `MATCH` thiếu PAD bị chặn; runtime role không UPDATE/DELETE được `face_verifications`.

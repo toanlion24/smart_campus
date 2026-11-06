@@ -130,3 +130,18 @@ Các route user cần access token. null trong cột scope nghĩa mọi user đ�
 | POST | /api/v1/admin/schedules | ['ADMIN'] | 430 |
 | POST | /api/v1/admin/class-sections/:id/enrollments | ['ADMIN'] | 431 |
 | POST | /api/v1/admin/class-sections/:id/teaching-assignments | ['ADMIN'] | 432 |
+
+## Route thiết bị (ngoài bảng trên)
+
+Khai báo qua `deviceRoute` ở [app.ts:101–114](../backend/src/app.ts), dùng device credential, rate limit 120/phút/thiết bị; mutation dùng `Idempotency-Key`, riêng `/device-events` dùng `eventId` trong body.
+
+| Method | Path | Dòng app.ts |
+| --- | --- | --- |
+| GET | /api/v1/device/config | 101 |
+| POST | /api/v1/device/config-ack | 102 |
+| POST | /api/v1/device/heartbeat | 109 |
+| POST | /api/v1/device/challenges | 110 |
+| POST | /api/v1/device-events | 111 |
+| GET | /api/v1/device-events/:eventId | 112 |
+| GET | /api/v1/device/pending-actions | 113 |
+| GET | /api/v1/device/actions/:id | 114 |

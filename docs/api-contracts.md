@@ -4,6 +4,8 @@
 
 > Thiết kế đã được người dùng duyệt ngày 05/11/2026. Đây là tài liệu thiết kế gốc; xem [trạng thái triển khai](implementation-status.md) và [runbook](SETUP_SMART_CAMPUS.md) cho code, lệnh chạy và bằng chứng hiện hành.
 
+> **Cập nhật 06/11/2026:** mục 1–9 đã được implement trong `backend/src` (xem [api-routes.md](api-routes.md); 8 route thiết bị ở mục 3 nằm ngoài bảng 124 route vì khai báo qua `deviceRoute`). [Mục 10](#10-bổ-sung-06112026-điểm-danh-rfid-face-11-thật-object-và-vận-hành) là contract đề xuất cho các phần kế hoạch 8 tuần còn thiếu, **chưa implement**.
+
 05/11/2026, **đề xuất v1 chờ duyệt**, chưa implement. API prototype hiện tại là `/v1/device-events` chỉ ATTENDANCE và khác contract bên dưới. Không thử gọi endpoint thiết kế rồi kết luận code hiện có lỗi.
 
 ## 1. Quy ước HTTP và auth
@@ -246,3 +248,92 @@ Face thất bại: identity=null; recognitionStatus MATCH/NO_MATCH/LOW_CONFIDENC
 OCR status READ/UNREADABLE/LOW_CONFIDENCE/ERROR; raw/normalized null khi unreadable. Normalization do backend/shared normalizer kiểm lại, không mù quáng tin string provider. Correction là record khác tham chiếu observation gốc. evidenceRef là ID private store/fixture, không URL bất kỳ do user truyền để backend fetch (tránh SSRF).
 
 Timeout provider map PROVIDER_TIMEOUT, không fallback từ fail/unknown sang MATCH. Event IDs/payload schema phải có contract tests với adapter giả khi triển khai; chúng không thay hardware acceptance. API OpenAPI machine-readable và codegen Flutter sẽ được tạo cùng GĐ2–7, chưa có trong giai đoạn tài liệu này.
+
+## 10. Bổ sung 06/11/2026: điểm danh RFID, Face 1:1 thật, object và vận hành
+
+Contract đề xuất, **chưa implement**; dữ liệu đi kèm ở [migration 004](database-design.md#11-migration-004-đề-xuất-06112026). Quy ước mục 1 giữ nguyên: envelope `data/requestId`, lỗi `error.code`, `Idempotency-Key` cho mọi mutation người dùng, `eventId` cho thiết bị. Client không gửi số tiền, giờ gửi xe hay kết luận Face.
+
+### 10.1 Điểm danh RFID thật
+
+| Method/path | Actor | Thay đổi so với hiện tại |
+| --- | --- | --- |
+| POST `/attendance/sessions` | LECTURER assigned | `deviceId` nhận thiết bị role `ATTENDANCE_READER` (hiện chỉ `ATTENDANCE_CAMERA`); phải cùng `classroom_id` với lịch |
+| POST `/attendance/sessions/{id}/open` | LECTURER assigned | Ngoài roster snapshot, tạo một `device_contexts` `multi_use`, hết hạn lúc `schedules.ends_at` |
+| POST `/attendance/sessions/{id}/close` | LECTURER assigned | Đóng context cùng transaction tạo ABSENT; lượt quét sau đó nhận `SESSION_NOT_OPEN` |
+| POST `/device/challenges` | Device | Không đổi; `contextId` là context của phiên đang mở |
+| POST `/device-events` | Device | Context `ATTENDANCE` + thẻ hợp lệ → ghi `attendance_records` (`source=REAL`, `method=RFID`) **trong cùng transaction**, trả kết quả cuối, không cần bước staff |
+
+ACK điểm danh trả 201 khi ghi mới, 200 khi quét lặp (cùng thẻ, cùng phiên), dùng `lcdLines` không dấu tối đa 16 ký tự:
+
+```json
+{
+  "data": {
+    "eventId": "11111111-1111-4111-8111-111111111111",
+    "source": "REAL",
+    "outcome": "RECORDED",
+    "attendanceStatus": "PRESENT",
+    "lcdLines": ["CO MAT", "SV ****0304"]
+  },
+  "requestId": "trace-example"
+}
+```
+
+| Tình huống | HTTP | `error.code` hoặc `outcome` | Ghi DB |
+| --- | --- | --- | --- |
+| Lần đầu, trước `late_after` / sau `late_after` | 201 | `RECORDED`, PRESENT / LATE | 1 bản ghi + device_event |
+| Quét lại cùng thẻ trong phiên | 200 | `ALREADY_RECORDED` | chỉ device_event mới |
+| ESP32 retry cùng `eventId` + payload | ACK cũ | như lần đầu | không ghi thêm |
+| Cùng `eventId`, payload khác | 409 | `IDEMPOTENCY_CONFLICT` | không |
+| Không có trong roster lúc mở phiên | 422 | `NOT_ENROLLED` | device_event từ chối |
+| Phiên đã đóng hoặc hủy | 422 | `SESSION_NOT_OPEN` | device_event từ chối |
+| Thẻ LOST/REVOKED/EXPIRED | 422 | `CARD_NOT_ACTIVE` | device_event từ chối |
+| Reader sai phòng hoặc chưa ACK config | 409 | `DEVICE_ROLE_MISMATCH` | không |
+
+Không trừ tiền trong luồng này (tiêu chí 2 tuần 2). Socket.IO phát `attendance.recorded` tới room `attendance:{sessionId}` sau commit.
+
+### 10.2 Face 1:1 từ Web và Android
+
+Sinh viên đã đăng nhập tự xác minh trên thiết bị của mình. Danh tính lấy từ access token, không từ body; AI chỉ so với profile của đúng người đó.
+
+| Method/path | Actor | Request → kết quả |
+| --- | --- | --- |
+| POST `/me/biometric-profiles/enrollment-requests` | STUDENT | multipart: `consentId`, 3 ảnh JPEG (cạnh dài ≤ 800 px, ≤ 500 KB mỗi ảnh) → 201 profile `REAL` ACTIVE, `modelVersion`; lỗi `CONSENT_REQUIRED`, `FACE_QUALITY_LOW`, `PAD_FAILED` |
+| POST `/face-verifications` | STUDENT | multipart: `purpose` (ATTENDANCE/CANTEEN/PARKING), `contextId`, 1 ảnh → 201 `{verificationId, decision, identityAssertionId?, expiresAt}` |
+| GET `/me/face-verifications` | STUDENT | 20 lần gần nhất: thời điểm, purpose, decision, lý do; không trả similarity hay ảnh |
+| POST `/attendance/sessions/{id}/face-check-ins` | STUDENT trong roster | `identityAssertionId` → ghi `attendance_records` `source=REAL`, `method=FACE`; cùng bảng lỗi mục 10.1 cộng `IDENTITY_EXPIRED` |
+| POST `/me/payments/{id}/approvals` | STUDENT | Thêm `method: FACE` + `identityAssertionId` thay PIN **chỉ khi GV duyệt** (xem [architecture.md 9.3](architecture.md#93-các-điểm-khác-cần-chốt-với-giảng-viên)) |
+
+Với điểm danh, `contextId` là context `multi_use` của phiên; với căn tin, context của đơn ở quầy. Assertion hết hạn sau 60 giây, dùng một lần, sai purpose hoặc sai context bị `consumeIdentity` từ chối. Rate limit 5 lần/phút/sinh viên để chống dò ngưỡng.
+
+Face trên điện thoại riêng chỉ chứng minh **ai**, không chứng minh sinh viên **đang ở trong lớp**. Để không điểm danh hộ từ xa, `face-check-ins` cần thêm một yếu tố vị trí do nhóm chọn: mã 6 số đổi mỗi 30 giây do giảng viên chiếu (`GET /attendance/sessions/{id}/rotating-code`), hoặc thiết bị camera đặt trong phòng (role `ATTENDANCE_CAMERA` đã có). Nếu chưa chốt, tuần 3 chỉ demo Face ở quầy căn tin/gửi xe và giữ RFID cho điểm danh.
+
+| `decision` | Điều kiện | `identityAssertionId` |
+| --- | --- | --- |
+| `MATCH` | Chất lượng OK, similarity ≥ ngưỡng đã khóa, PAD PASS | có |
+| `NO_MATCH` | Chất lượng OK, similarity < ngưỡng | không |
+| `REJECTED` | Ảnh mờ/tối, không mặt, nhiều mặt hoặc PAD FAIL | không |
+| `ERROR` | AI timeout hoặc lỗi; trả 503 `AI_UNAVAILABLE`, client gợi ý dùng RFID | không |
+
+Contract nội bộ backend → AI service (mạng `private`, `Authorization: Bearer <AI_SERVICE_TOKEN>`, timeout 3 giây):
+
+| Method/path | Request | Response |
+| --- | --- | --- |
+| POST `/internal/face/embed` | ảnh JPEG | `{quality, faceCount, embedding: float[], pad: {status, score}, modelVersion, latencyMs}` |
+| POST `/internal/face/verify` | ảnh JPEG + `template: float[]` + `threshold` | `{quality, faceCount, similarity, pad: {status, score}, modelVersion, latencyMs}` |
+| GET `/readyz` | — | 200 khi model detect/embed/PAD đã nạp và khớp SHA-256 trong `models/manifest.json`; 503 nếu thiếu PAD |
+
+Backend giải mã template từ kho object, gửi cho AI, rồi quyết định MATCH. AI không giữ template, không có credential DB và không trả kết quả cuối.
+
+### 10.3 Object
+
+Không có route upload chung. Ảnh đi vào qua các route nghiệp vụ ở 10.2 (và ảnh sản phẩm qua `PATCH /canteen/products/{id}` nếu cần), backend ghi `stored_objects` và lưu vào kho private. Không trả URL trực tiếp tới kho; ảnh sản phẩm (nếu có) đi qua GET `/canteen/products/{id}/image` có kiểm quyền. Ảnh Face không có route đọc.
+
+### 10.4 Vận hành
+
+| Method/path | Actor | Nội dung |
+| --- | --- | --- |
+| GET `/healthz` | Công khai | Không đổi: liveness |
+| GET `/readyz` | Công khai | Thêm kiểm AI `/readyz` khi `FACE_PROVIDER=REAL`; chi tiết lỗi chỉ ghi log |
+| GET `/admin/ops/status` | ADMIN | Phiên bản app và migration, `last_seen_at` thiết bị, outbox pending/dead letter, kết quả đối soát ví gần nhất |
+
+Giám sát uptime gọi `/healthz` từ bên ngoài VPS. Tuổi bản backup và dung lượng đĩa do job cron trên máy chủ kiểm, không đi qua API. P95 tính từ access log Caddy (trường `duration`) nhóm theo route: CRUD, `/device-events`, `/face-verifications`.
